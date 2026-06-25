@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Repository laden
+      - name: Repository auschecken
         uses: actions/checkout@v4
 
       - name: Python einrichten
@@ -18,12 +18,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Pakete installieren
-        run: pip install -r requirements.txt
+      - name: Abhängigkeiten installieren
+        run: |
+          pip install -r requirements.txt
 
-      - name: Monitor ausführen
+      - name: Playwright installieren
+        run: |
+          python -m playwright install chromium
+
+      - name: Monitor starten
         env:
-          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        run: python monitor.py
+          NTFY_TOPIC: cornelia-portasplit-94713
+        run: |
+          python monitor.py
