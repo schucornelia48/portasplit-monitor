@@ -1,6 +1,5 @@
-import json, os, re, smtplib, sys
+import json, os, re, requests
 from datetime import datetime, timezone
-from email.message import EmailMessage
 from pathlib import Path
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -48,7 +47,6 @@ def accept_cookies(page):
 
 def try_select_market(page, market):
     """Versucht, im Toom-Shop den Markt zu setzen. Wenn Toom die Seite ändert, bleibt ein Fallback."""
-    # 1) Erst Marktseite öffnen; manche Shops setzen dabei Cookie/Session für den Markt.
     try:
         page.goto(market["market_url"], wait_until="networkidle", timeout=45000)
         accept_cookies(page)
@@ -60,11 +58,9 @@ def try_select_market(page, market):
     except Exception:
         pass
 
-    # 2) Produktseite öffnen.
     page.goto(PRODUCT["url"], wait_until="networkidle", timeout=45000)
     accept_cookies(page)
 
-    # 3) Falls ein Marktauswahl-Dialog existiert, versuchen wir ihn zu benutzen.
     for label in ["Anderen Markt auswählen", "Mein Markt", "Markt auswählen", "Markt ändern", "Verfügbarkeit in anderen Märkten"]:
         try:
             page.get_by_text(re.compile(label, re.I)).first.click(timeout=2500)
@@ -73,13 +69,11 @@ def try_select_market(page, market):
         except Exception:
             pass
 
-    # Suchfeld befüllen, falls vorhanden.
     try:
-        inp = page.locator("input").filter(has_text="").first
+        inp = page.locator("input").first
         inp.fill(market["search"], timeout=3000)
         page.keyboard.press("Enter")
         page.wait_for_timeout(2500)
-        # Ergebnis mit Marktname anklicken.
         page.get_by_text(re.compile(market["name"].split("-")[0], re.I)).first.click(timeout=3000)
         page.wait_for_timeout(2000)
     except Exception:
@@ -87,42 +81,59 @@ def try_select_market(page, market):
 
 
 def check_market(browser, market):
-    page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36")
+    page = browser.new_page(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126 Safari/537.36"
+    )
     try:
         try_select_market(page, market)
         page.wait_for_timeout(2000)
         text = page.locator("body").inner_text(timeout=10000)
         status = classify(text)
-        return {"market": market["name"], "status": status, "excerpt": short_text(text), "url": PRODUCT["url"]}
+        return {
+            "market": market["name"],
+            "status": status,
+            "excerpt": short_text(text),
+            "url": PRODUCT["url"],
+        }
     except PlaywrightTimeoutError as e:
-        return {"market": market["name"], "status": "FEHLER", "excerpt": f"Timeout: {e}", "url": PRODUCT["url"]}
+        return {
+            "market": market["name"],
+            "status": "FEHLER",
+            "excerpt": f"Timeout: {e}",
+            "url": PRODUCT["url"],
+        }
     except Exception as e:
-        return {"market": market["name"], "status": "FEHLER", "excerpt": repr(e), "url": PRODUCT["url"]}
+        return {
+            "market": market["name"],
+            "status": "FEHLER",
+            "excerpt": repr(e),
+            "url": PRODUCT["url"],
+        }
     finally:
         page.close()
 
 
-def send_email(subject, body):
-    sender = os.environ.get("SMTP_USER")
-    password = os.environ.get("SMTP_PASSWORD")
-    recipient = os.environ.get("ALERT_TO", sender)
-    if not sender or not password or not recipient:
-        print("E-Mail nicht eingerichtet: SMTP_USER/SMTP_PASSWORD/ALERT_TO fehlen.")
-        print(body)
-        return
-    msg = EmailMessage()
-    msg["From"] = sender
-    msg["To"] = recipient
-    msg["Subject"] = subject
-    msg.set_content(body)
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(sender, password)
-        smtp.send_message(msg)
+def send_ntfy(subject, body):
+    topic = os.environ.get("NTFY_TOPIC", "cornelia-portasplit-94713")
+    url = f"https://ntfy.sh/{topic}"
+
+    response = requests.post(
+        url,
+        data=body.encode("utf-8"),
+        headers={
+            "Title": subject,
+            "Priority": "urgent",
+            "Tags": "warning,shopping_cart",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
 
 
 def main():
     state = load_state()
     results = []
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         for market in MARKETS:
@@ -132,33 +143,49 @@ def main():
         browser.close()
 
     now = datetime.now(timezone.utc).astimezone().strftime("%d.%m.%Y %H:%M")
+
     changed = []
     available = []
+
     for r in results:
         old = state.get(r["market"])
+
         if old != r["status"]:
             changed.append((old, r))
+
         if r["status"] == "MÖGLICHERWEISE_VERFÜGBAR":
             available.append(r)
+
         state[r["market"]] = r["status"]
+
     save_state(state)
 
-    # Mail nur bei Verfügbarkeit oder Statusänderung. Beim allerersten Lauf kommt eine Statusmail.
     if available:
         subject = "🎉 PortaSplit möglicherweise verfügbar!"
-        body = f"Stand: {now}\n\nMidea PortaSplit, Toom-Art.-Nr. {PRODUCT['article_number']}\n{PRODUCT['url']}\n\n"
-        body += "Positive Treffer:\n" + "\n".join(f"- {r['market']}: {r['status']}" for r in available)
-        body += "\n\nBitte sofort Toom-Seite/App prüfen oder im Markt anrufen. Der Monitor ist vorsichtig, aber nicht rechtsverbindlich/verbindlich für Bestand."
-        send_email(subject, body)
+        body = (
+            f"Stand: {now}\n\n"
+            f"Midea PortaSplit, Toom-Art.-Nr. {PRODUCT['article_number']}\n"
+            f"{PRODUCT['url']}\n\n"
+            "Positive Treffer:\n"
+            + "\n".join(f"- {r['market']}: {r['status']}" for r in available)
+            + "\n\nBitte sofort Toom-Seite/App prüfen oder im Markt anrufen. "
+            "Der Monitor ist vorsichtig und keine verbindliche Bestandsauskunft."
+        )
+        send_ntfy(subject, body)
+
     elif changed:
         subject = "PortaSplit-Monitor: Statusänderung"
         body = f"Stand: {now}\n\nStatusänderungen:\n"
+
         for old, r in changed:
             body += f"- {r['market']}: {old or 'neu'} → {r['status']}\n"
+
         body += f"\nLink: {PRODUCT['url']}\n"
-        send_email(subject, body)
+        send_ntfy(subject, body)
+
     else:
-        print("Keine Änderung; keine Mail.")
+        print("Keine Änderung; keine Nachricht.")
+
 
 if __name__ == "__main__":
     main()
